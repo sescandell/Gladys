@@ -2015,8 +2015,12 @@ async function getAllTools(userId) {
           'Each command carries the name of the tool to call and, in arguments, exactly the object that tool ' +
           'expects when called directly. ' +
           'Commands run one after the other in the order given, so a command may depend on the previous one. ' +
-          'A command that fails does not stop the batch: the result reports the outcome of every command, ' +
-          'so read it and only retry the ones that failed.',
+          'A command that fails does not stop the batch, the result reports every command. ' +
+          'In that result, status only says whether the command could be run at all: dispatched when the tool ' +
+          'was called, error when it was not. A dispatched tool can still report in its own words, in result, ' +
+          'that it did not act (unknown device, missing target, no matching feature). ' +
+          'Always read result, never status alone, before telling the user a change was applied, ' +
+          'and retry only the commands whose result says nothing was done.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           commands: z
@@ -2087,9 +2091,10 @@ async function getAllTools(userId) {
               results.push({
                 command: index + 1,
                 tool: command.tool,
-                status: 'ok',
-                // The unit tools already word their own outcome, the failures they report
-                // as text ("no device found") included: relay it verbatim.
+                // "dispatched", not "ok": the tool ran, which does not mean it acted.
+                // The unit tools word their own outcome, the failures they report as text
+                // ("no device found") included, and that text is relayed verbatim below.
+                status: 'dispatched',
                 result: (commandResult?.content || [])
                   .filter(({ type }) => type === 'text')
                   .map(({ text }) => text)
@@ -2100,7 +2105,9 @@ async function getAllTools(userId) {
                 command: index + 1,
                 tool: command.tool,
                 status: 'error',
-                result: e.message,
+                // A tool can reject with something that is not an Error: an empty
+                // message would leave the model with a failure it cannot report.
+                result: e?.message || String(e),
               });
             }
           }
@@ -2111,7 +2118,7 @@ async function getAllTools(userId) {
             {
               type: 'text',
               text: this.toon({
-                succeeded: results.filter(({ status }) => status === 'ok').length,
+                dispatched: results.filter(({ status }) => status === 'dispatched').length,
                 failed: results.filter(({ status }) => status === 'error').length,
                 results,
               }),

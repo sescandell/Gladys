@@ -4446,6 +4446,11 @@ describe('build schemas', () => {
       expect(batchTool.config.description).to.contain(
         'scene_start, device_turn_on_off, device_set_shutter, device_set_light',
       );
+      // status must not be sold as "the change was applied": a dispatched tool can
+      // still report in its own words that it did not act.
+      expect(batchTool.config.description).to.contain(
+        'Always read result, never status alone, before telling the user a change was applied',
+      );
 
       const [{ function: batchFunction }] = mcpToolsToChatApiFormat([batchTool]);
       expect(batchFunction.name).to.eq('device_batch_set_state');
@@ -4493,39 +4498,46 @@ describe('build schemas', () => {
       expect(mcpHandler.gladys.event.emit.callCount).to.eq(1);
 
       expect(JSON.parse(result.content[0].text)).to.deep.equal({
-        succeeded: 4,
+        dispatched: 4,
         failed: 0,
         results: [
           {
             command: 1,
             tool: 'device_turn_on_off',
-            status: 'ok',
+            status: 'dispatched',
             result: 'device.turn-on command sent for Lampe salon',
           },
           {
             command: 2,
             tool: 'device_set_light',
-            status: 'ok',
+            status: 'dispatched',
             result: 'device.set-light: brightness 20% command sent for Lampe salon',
           },
           {
             command: 3,
             tool: 'device_set_shutter',
-            status: 'ok',
+            status: 'dispatched',
             result: 'device.set-shutter: close command sent for Volet salon',
           },
-          { command: 4, tool: 'scene_start', status: 'ok', result: 'scene.start command sent' },
+          { command: 4, tool: 'scene_start', status: 'dispatched', result: 'scene.start command sent' },
         ],
       });
     });
 
     it('should keep going after a failing command and report every outcome', async () => {
       const mcpHandler = buildMcpHandler({
-        setValue: stub().callsFake((device) =>
-          device.selector === 'lampe-cuisine'
-            ? Promise.reject(new Error('MQTT broker unreachable'))
-            : Promise.resolve(),
-        ),
+        setValue: stub().callsFake((device) => {
+          if (device.selector === 'lampe-cuisine') {
+            return Promise.reject(new Error('MQTT broker unreachable'));
+          }
+          if (device.selector === 'volet-salon') {
+            // Not every integration rejects with an Error, which is exactly what
+            // this test covers.
+            // eslint-disable-next-line prefer-promise-reject-errors
+            return Promise.reject('Z-Wave node did not answer');
+          }
+          return Promise.resolve();
+        }),
       });
       const batchTool = await getBatchTool(mcpHandler);
 
@@ -4534,19 +4546,20 @@ describe('build schemas', () => {
           { tool: 'device_turn_on_off', arguments: { action: 'off', device: 'Lampe cuisine' } },
           { tool: 'device_turn_on_off', arguments: { action: 'off' } },
           { tool: 'device_turn_on_off' },
+          { tool: 'device_set_shutter', arguments: { action: 'close', device: 'Volet salon' } },
           { tool: 'device_turn_on_off', arguments: { action: 'off', device: 'Lampe salon' } },
         ],
       });
 
       expect(JSON.parse(result.content[0].text)).to.deep.equal({
-        succeeded: 3,
-        failed: 1,
+        dispatched: 3,
+        failed: 2,
         results: [
           { command: 1, tool: 'device_turn_on_off', status: 'error', result: 'MQTT broker unreachable' },
           {
             command: 2,
             tool: 'device_turn_on_off',
-            status: 'ok',
+            status: 'dispatched',
             result:
               'device.turn-off: missing target. Provide device name, or both room and device_category. ' +
               'Never call with only action.',
@@ -4554,15 +4567,16 @@ describe('build schemas', () => {
           {
             command: 3,
             tool: 'device_turn_on_off',
-            status: 'ok',
+            status: 'dispatched',
             result:
               'device.turn-undefined: missing target. Provide device name, or both room and device_category. ' +
               'Never call with only action.',
           },
+          { command: 4, tool: 'device_set_shutter', status: 'error', result: 'Z-Wave node did not answer' },
           {
-            command: 4,
+            command: 5,
             tool: 'device_turn_on_off',
-            status: 'ok',
+            status: 'dispatched',
             result: 'device.turn-off command sent for Lampe salon',
           },
         ],
@@ -4570,6 +4584,7 @@ describe('build schemas', () => {
       // The last command ran even though the first one threw.
       expect(mcpHandler.gladys.device.setValue.args.map(([device]) => device.selector)).to.deep.equal([
         'lampe-cuisine',
+        'volet-salon',
         'lampe-salon',
       ]);
     });
@@ -4582,7 +4597,7 @@ describe('build schemas', () => {
       });
 
       expect(JSON.parse(result.content[0].text)).to.deep.equal({
-        succeeded: 0,
+        dispatched: 0,
         failed: 2,
         results: [
           {
