@@ -22,8 +22,21 @@ const {
 const { fetchWebPage } = require('./webRequest');
 const { compareTimes } = require('./compareTimes');
 const { formatWeather } = require('./formatWeather');
+const { toolNameFromIntent } = require('./mcpToolsToChatApiFormat');
 
 const DEFAULT_TIMEZONE = 'Europe/Paris';
+
+// Tools device.batch-set-state can dispatch to: the ones that act on the home right
+// now. Read tools are deliberately out, so a batch result stays a list of applied
+// changes instead of a mix of measurements, camera images and commands.
+const BATCHABLE_INTENTS = [
+  'device.turn-on-off',
+  'device.set-shutter',
+  'device.set-light',
+  'sensor.set-state',
+  'scene.start',
+];
+const MAX_BATCH_COMMANDS = 50;
 
 const noRoom = {
   id: null,
@@ -701,7 +714,7 @@ async function getAllTools(userId) {
       config: {
         title: 'Turn on/off devices',
         description:
-          'Turn a device on or off. Requires either `device` (exact device name from the enum), or both `room` and `device_category` together. Never call with only `action`. For requests covering multiple rooms (for example "all lights"), call once per room with room and device_category, or use device_get_state with device_type light then turn off each device by name.',
+          'Turn a device on or off. Requires either `device` (exact device name from the enum), or both `room` and `device_category` together. Never call with only `action`. For requests covering several devices or rooms (for example "all lights"), do not call this tool repeatedly: use device_batch_set_state with one command per target in a single call.',
         requireDeviceTargeting: true,
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
@@ -919,7 +932,7 @@ async function getAllTools(userId) {
       config: {
         title: 'Control shutters and curtains',
         description:
-          'Open, close, stop or set the position of shutters and curtains. Use action for open/close/stop commands, or position (0-100) to set a percentage. Select the device by name, or by room and device category.',
+          'Open, close, stop or set the position of shutters and curtains. Use action for open/close/stop commands, or position (0-100) to set a percentage. Select the device by name, or by room and device category. For requests covering several devices or rooms (for example "all the shutters"), use device_batch_set_state with one command per target in a single call.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           action: z
@@ -1077,7 +1090,9 @@ async function getAllTools(userId) {
           'Provide at least one of brightness (percent 0-100), color (hex RGB, for example #0000FF for blue) ' +
           'or temperature (Kelvin, for example 2700 for warm white, 4000 for neutral white, 6500 for cool white). ' +
           'Select the light by device name, or by room to target every light of the room. ' +
-          'This tool does not turn lights on or off, use device_turn_on_off for that.',
+          'This tool does not turn lights on or off, use device_turn_on_off for that. ' +
+          'For requests covering several lights or rooms, use device_batch_set_state with one command ' +
+          'per target in a single call.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           brightness: z
@@ -1978,6 +1993,134 @@ async function getAllTools(userId) {
       },
     },
   );
+
+  // Built last, from the tools this home actually got: a home without shutter never
+  // exposes device_set_shutter, and must not be told it can batch one.
+  const batchableTools = tools.filter(({ intent }) => BATCHABLE_INTENTS.includes(intent));
+
+  if (batchableTools.length > 0) {
+    const batchableToolNames = batchableTools.map(({ intent }) => toolNameFromIntent(intent));
+    const callbacksByToolName = new Map(batchableTools.map(({ intent, cb }) => [toolNameFromIntent(intent), cb]));
+
+    tools.push({
+      intent: 'device.batch-set-state',
+      config: {
+        title: 'Apply several changes to the home in one call',
+        description:
+          'Apply several changes to the home in a single call, by listing the unit tool calls to perform. ' +
+          'Prefer it over calling the unit tools one after the other as soon as more than one change is needed ' +
+          '("turn off all the lights", "close every shutter", "turn the lamp on and dim it to 20%"): ' +
+          'it takes one call instead of one per device. ' +
+          `Tools that can be batched: ${batchableToolNames.join(', ')}. ` +
+          'Each command carries the name of the tool to call and, in arguments, exactly the object that tool ' +
+          'expects when called directly. ' +
+          'Commands run one after the other in the order given, so a command may depend on the previous one. ' +
+          'A command that fails does not stop the batch: the result reports the outcome of every command, ' +
+          'so read it and only retry the ones that failed.',
+        categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
+        inputSchema: {
+          commands: z
+            .array(
+              z.object({
+                tool: z.enum(batchableToolNames).describe('Name of the tool to call for this command.'),
+                arguments: z
+                  .record(z.string(), z.any())
+                  .describe('Arguments of that tool, exactly as they would be passed to it in a direct call.'),
+              }),
+            )
+            .min(1)
+            .max(MAX_BATCH_COMMANDS)
+            .describe('Changes to apply, applied one after the other in this order.'),
+        },
+      },
+      cb: async ({ commands }) => {
+        // The chat gateway runs this callback with the raw arguments of the model, which
+        // is not bound by the schema above: an empty or malformed batch has to be named
+        // as such, otherwise it reads as "the changes were applied".
+        if (!Array.isArray(commands) || commands.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  'device.batch-set-state: commands must be a non-empty array of { tool, arguments }, ' +
+                  'no change was applied.',
+              },
+            ],
+          };
+        }
+
+        if (commands.length > MAX_BATCH_COMMANDS) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  `device.batch-set-state: ${commands.length} commands were sent, the limit is ` +
+                  `${MAX_BATCH_COMMANDS}. No change was applied, split the request into several calls.`,
+              },
+            ],
+          };
+        }
+
+        const results = [];
+
+        // Sequential on purpose: two commands can target the same device (turn a light on,
+        // then set its brightness), and the order the model gave is the order the user
+        // asked for. It also keeps a batch of thirty shutters from flooding the radio network.
+        // eslint-disable-next-line no-restricted-syntax
+        for (const [index, command] of commands.entries()) {
+          const toolCallback = callbacksByToolName.get(command?.tool);
+
+          if (!toolCallback) {
+            results.push({
+              command: index + 1,
+              tool: command?.tool,
+              status: 'error',
+              result: `unknown tool, tools that can be batched: ${batchableToolNames.join(', ')}`,
+            });
+          } else {
+            try {
+              // eslint-disable-next-line no-await-in-loop
+              const commandResult = await toolCallback(command.arguments || {});
+
+              results.push({
+                command: index + 1,
+                tool: command.tool,
+                status: 'ok',
+                // The unit tools already word their own outcome, the failures they report
+                // as text ("no device found") included: relay it verbatim.
+                result: (commandResult?.content || [])
+                  .filter(({ type }) => type === 'text')
+                  .map(({ text }) => text)
+                  .join(' '),
+              });
+            } catch (e) {
+              results.push({
+                command: index + 1,
+                tool: command.tool,
+                status: 'error',
+                result: e.message,
+              });
+            }
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: this.toon({
+                succeeded: results.filter(({ status }) => status === 'ok').length,
+                failed: results.filter(({ status }) => status === 'error').length,
+                results,
+              }),
+            },
+          ],
+        };
+      },
+    });
+  }
 
   return tools;
 }
