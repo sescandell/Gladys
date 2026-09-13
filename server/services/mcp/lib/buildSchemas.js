@@ -6,6 +6,7 @@ const {
   DEVICE_FEATURE_UNITS,
   COVER_STATE,
   AI_CHAT_TOOL_CATEGORIES,
+  AI_CHAT_TOOL_CATEGORIES_LIST,
   WEATHER_UNITS,
 } = require('../../../utils/constants');
 const { ServiceNotConfiguredError } = require('../../../utils/coreErrors');
@@ -22,8 +23,17 @@ const {
 const { fetchWebPage } = require('./webRequest');
 const { compareTimes } = require('./compareTimes');
 const { formatWeather } = require('./formatWeather');
+const { toolNameFromIntent } = require('./mcpToolsToChatApiFormat');
 
 const DEFAULT_TIMEZONE = 'Europe/Paris';
+
+// Every tool can be batched but these. scene.create is singled out because the chat
+// gateway tracks it by name (sceneCreateSuccessCount / lastSceneCreateErrorText in
+// gateway.forwardMessageToAiChat, reused as the final answer): batched, the tool name
+// it sees is the batch, and that recovery logic would silently stop working. Its
+// schema is also the large one the two-stage router exists to keep out of the context.
+const NON_BATCHABLE_INTENTS = ['scene.create'];
+const MAX_BATCH_CALLS = 50;
 
 const noRoom = {
   id: null,
@@ -462,7 +472,9 @@ async function getAllTools(userId) {
       intent: 'camera.get-image',
       config: {
         title: 'Get image from camera',
-        description: 'Get image from camera in specific room.',
+        description:
+          'Get image from camera in specific room. One room per call: for several rooms, ' +
+          'use batch_tool_calls with one call per room.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_QUERY, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           room: z.enum(rooms.map(({ name }) => name)).describe('Room to get image from.'),
@@ -701,7 +713,7 @@ async function getAllTools(userId) {
       config: {
         title: 'Turn on/off devices',
         description:
-          'Turn a device on or off. Requires either `device` (exact device name from the enum), or both `room` and `device_category` together. Never call with only `action`. For requests covering multiple rooms (for example "all lights"), call once per room with room and device_category, or use device_get_state with device_type light then turn off each device by name.',
+          'Turn a device on or off. Requires either `device` (exact device name from the enum), or both `room` and `device_category` together. Never call with only `action`. For requests covering several devices or rooms (for example "all lights"), do not call this tool repeatedly: use batch_tool_calls with one call per target in a single call.',
         requireDeviceTargeting: true,
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
@@ -808,7 +820,9 @@ async function getAllTools(userId) {
       intent: 'device.get-history',
       config: {
         title: 'Get device history',
-        description: 'Get history states of specific device.',
+        description:
+          'Get history states of specific device. One device and one feature per call: for several of them, ' +
+          'use batch_tool_calls with one call per device instead of calling this tool repeatedly.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_QUERY, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           room: z
@@ -919,7 +933,7 @@ async function getAllTools(userId) {
       config: {
         title: 'Control shutters and curtains',
         description:
-          'Open, close, stop or set the position of shutters and curtains. Use action for open/close/stop commands, or position (0-100) to set a percentage. Select the device by name, or by room and device category.',
+          'Open, close, stop or set the position of shutters and curtains. Use action for open/close/stop commands, or position (0-100) to set a percentage. Select the device by name, or by room and device category. For requests covering several devices or rooms (for example "all the shutters"), use batch_tool_calls with one call per target in a single call.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           action: z
@@ -1077,7 +1091,9 @@ async function getAllTools(userId) {
           'Provide at least one of brightness (percent 0-100), color (hex RGB, for example #0000FF for blue) ' +
           'or temperature (Kelvin, for example 2700 for warm white, 4000 for neutral white, 6500 for cool white). ' +
           'Select the light by device name, or by room to target every light of the room. ' +
-          'This tool does not turn lights on or off, use device_turn_on_off for that.',
+          'This tool does not turn lights on or off, use device_turn_on_off for that. ' +
+          'For requests covering several lights or rooms, use batch_tool_calls with one call ' +
+          'per target in a single call.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_CONTROL, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           brightness: z
@@ -1554,7 +1570,8 @@ async function getAllTools(userId) {
           'instead of one call per month. ' +
           'The result contains the total over the period and the detail per group_by period. ' +
           'In currency mode, a separate home_subscription entry may be present: it is the fixed subscription cost ' +
-          'of the whole home electricity contract, and is not part of the device consumption cost.',
+          'of the whole home electricity contract, and is not part of the device consumption cost. ' +
+          'One device per call: to cover several devices, use batch_tool_calls with one call per device.',
         categories: [AI_CHAT_TOOL_CATEGORIES.DEVICE_QUERY, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           device: z
@@ -1903,7 +1920,7 @@ async function getAllTools(userId) {
       config: {
         title: 'Fetch web page',
         description:
-          'Fetch a public web page and return its readable text content. Use this to read information from websites such as opening hours, schedules, or public announcements. Only HTTP/HTTPS public URLs are allowed.',
+          'Fetch a public web page and return its readable text content. Use this to read information from websites such as opening hours, schedules, or public announcements. Only HTTP/HTTPS public URLs are allowed. One URL per call: to read several pages, use batch_tool_calls with one call per URL.',
         categories: [AI_CHAT_TOOL_CATEGORIES.WEB_AND_TIME, AI_CHAT_TOOL_CATEGORIES.OTHER],
         inputSchema: {
           url: z.url().describe('Full public URL of the page to fetch (http or https).'),
@@ -1978,6 +1995,155 @@ async function getAllTools(userId) {
       },
     },
   );
+
+  // Built last, from the tools this home actually got: a home without shutter never
+  // exposes device_set_shutter, and must not be told it can batch one.
+  const batchableTools = tools.filter(({ intent }) => !NON_BATCHABLE_INTENTS.includes(intent));
+
+  if (batchableTools.length > 0) {
+    const batchableToolNames = batchableTools.map(({ intent }) => toolNameFromIntent(intent));
+    const callbacksByToolName = new Map(batchableTools.map(({ intent, cb }) => [toolNameFromIntent(intent), cb]));
+
+    tools.push({
+      intent: 'batch.tool-calls',
+      config: {
+        title: 'Run several tool calls in one call',
+        description:
+          'Run several other tool calls in a single call, by listing them. ' +
+          'Prefer it over calling those tools one after the other as soon as more than one call is needed, ' +
+          'whether they act on the home ("turn off all the lights", "close every shutter") or read from it ' +
+          '(the history of four rooms, the monthly consumption of six devices, three web pages): ' +
+          'it takes one call instead of one per target, and the unit tools are single-target. ' +
+          `Tools that can be batched: ${batchableToolNames.join(', ')}. ` +
+          'Each call carries the name of the tool to call and, in arguments, exactly the object that tool ' +
+          'expects when called directly. ' +
+          'Calls run one after the other in the order given, so a call may depend on the previous one. ' +
+          'A call that fails does not stop the batch, the result reports every call. ' +
+          'In that result, status only says whether the call could be run at all: dispatched when the tool ' +
+          'was called, error when it was not. A dispatched tool can still report in its own words, in result, ' +
+          'that it did not act (unknown device, missing target, no matching feature). ' +
+          'Always read result, never status alone, before telling the user a change was applied, ' +
+          'and retry only the calls whose result says nothing was done.',
+        // Batching is useful whatever the request is about, so this tool must survive
+        // every routing decision of gateway.classifyAiChatToolCategories.
+        categories: [...AI_CHAT_TOOL_CATEGORIES_LIST],
+        inputSchema: {
+          calls: z
+            .array(
+              z.object({
+                tool: z.enum(batchableToolNames).describe('Name of the tool to call.'),
+                arguments: z
+                  .record(z.string(), z.any())
+                  .describe('Arguments of that tool, exactly as they would be passed to it in a direct call.'),
+              }),
+            )
+            .min(1)
+            .max(MAX_BATCH_CALLS)
+            .describe('Tool calls to run, one after the other in this order.'),
+        },
+      },
+      cb: async ({ calls }) => {
+        // The chat gateway runs this callback with the raw arguments of the model, which
+        // is not bound by the schema above: an empty or malformed batch has to be named
+        // as such, otherwise it reads as "the calls were run".
+        if (!Array.isArray(calls) || calls.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'batch.tool-calls: calls must be a non-empty array of { tool, arguments }, nothing was run.',
+              },
+            ],
+          };
+        }
+
+        if (calls.length > MAX_BATCH_CALLS) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  `batch.tool-calls: ${calls.length} calls were sent, the limit is ${MAX_BATCH_CALLS}. ` +
+                  'Nothing was run, split the request into several calls.',
+              },
+            ],
+          };
+        }
+
+        const results = [];
+        // A batched camera.get-image still has to reach the user: the gateway picks the
+        // images out of the content of the tool result, so they are carried up next to
+        // the summary instead of being dropped with the rest of the non-text blocks.
+        const images = [];
+
+        // Sequential on purpose: two calls can target the same device (turn a light on,
+        // then set its brightness), and the order the model gave is the order the user
+        // asked for. It also keeps a batch of thirty shutters from flooding the radio network.
+        // eslint-disable-next-line no-restricted-syntax
+        for (const [index, call] of calls.entries()) {
+          const toolCallback = callbacksByToolName.get(call?.tool);
+
+          if (!toolCallback) {
+            results.push({
+              call: index + 1,
+              tool: call?.tool,
+              status: 'error',
+              result: `unknown tool, tools that can be batched: ${batchableToolNames.join(', ')}`,
+            });
+          } else {
+            try {
+              // eslint-disable-next-line no-await-in-loop
+              const callResult = await toolCallback(call.arguments || {});
+              const content = callResult?.content || [];
+              const imagesOfThisCall = content.filter(({ type }) => type === 'image');
+              images.push(...imagesOfThisCall);
+
+              // The unit tools word their own outcome, the failures they report as text
+              // ("no device found") included, and that text is relayed verbatim.
+              const text = content
+                .filter(({ type }) => type === 'text')
+                .map(({ text: textOfBlock }) => textOfBlock)
+                .join(' ');
+
+              results.push({
+                call: index + 1,
+                tool: call.tool,
+                // "dispatched", not "ok": the tool ran, which does not mean it acted.
+                status: 'dispatched',
+                result:
+                  imagesOfThisCall.length > 0
+                    ? `${text} ${imagesOfThisCall.length} image(s) returned to the user.`.trim()
+                    : text,
+              });
+            } catch (e) {
+              results.push({
+                call: index + 1,
+                tool: call.tool,
+                status: 'error',
+                // A tool can reject with something that is not an Error: an empty
+                // message would leave the model with a failure it cannot report.
+                result: e?.message || String(e),
+              });
+            }
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: this.toon({
+                dispatched: results.filter(({ status }) => status === 'dispatched').length,
+                failed: results.filter(({ status }) => status === 'error').length,
+                results,
+              }),
+            },
+            ...images,
+          ],
+        };
+      },
+    });
+  }
 
   return tools;
 }

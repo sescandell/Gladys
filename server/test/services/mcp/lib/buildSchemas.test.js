@@ -4,7 +4,12 @@ const sinon = require('sinon').createSandbox();
 const { stub, fake } = sinon;
 const nock = require('nock');
 const dns = require('dns');
-const { SYSTEM_VARIABLE_NAMES, COVER_STATE, AI_CHAT_TOOL_CATEGORIES } = require('../../../../utils/constants');
+const {
+  SYSTEM_VARIABLE_NAMES,
+  COVER_STATE,
+  AI_CHAT_TOOL_CATEGORIES,
+  AI_CHAT_TOOL_CATEGORIES_LIST,
+} = require('../../../../utils/constants');
 const { ServiceNotConfiguredError } = require('../../../../utils/coreErrors');
 const {
   getAllResources,
@@ -605,12 +610,16 @@ describe('build schemas', () => {
         AI_CHAT_TOOL_CATEGORIES.SCENES,
         AI_CHAT_TOOL_CATEGORIES.OTHER,
       ],
+      'batch.tool-calls': AI_CHAT_TOOL_CATEGORIES_LIST,
     });
 
     // Tool: camera.get-image
     expect(tools[0].intent).to.eq('camera.get-image');
     expect(tools[0].config.title).to.eq('Get image from camera');
-    expect(tools[0].config.description).to.eq('Get image from camera in specific room.');
+    expect(tools[0].config.description).to.eq(
+      'Get image from camera in specific room. One room per call: for several rooms, ' +
+        'use batch_tool_calls with one call per room.',
+    );
 
     const cameraResult = await tools[0].cb({ room: 'salon' });
     expect(mcpHandler.gladys.device.camera.getImagesInRoom.calledWith('room-1')).to.eq(true);
@@ -1050,7 +1059,7 @@ describe('build schemas', () => {
 
     // Verify tools are created successfully
     expect(tools).to.be.an('array');
-    expect(tools.length).to.eq(8);
+    expect(tools.length).to.eq(9);
 
     // Test device.get-state - should return all devices with and without room
     const stateResult = await tools[3].cb({ room: undefined, device_type: undefined });
@@ -4356,6 +4365,326 @@ describe('build schemas', () => {
       const tools = await mcpHandler.getAllTools('user-1');
 
       expect(tools.find((tool) => tool.intent === 'weather.get')).to.equal(undefined);
+    });
+  });
+
+  describe('batch.tool-calls tool', () => {
+    const lampeSalon = {
+      selector: 'lampe-salon',
+      name: 'Lampe salon',
+      room: { name: 'Salon', selector: 'salon' },
+      features: [
+        { id: 'f-lampe-binary', selector: 'lampe-salon-binary', name: 'On/Off', category: 'light', type: 'binary' },
+        {
+          id: 'f-lampe-brightness',
+          selector: 'lampe-salon-brightness',
+          name: 'Luminosité',
+          category: 'light',
+          type: 'brightness',
+          min: 0,
+          max: 100,
+        },
+      ],
+    };
+    const voletSalon = {
+      selector: 'volet-salon',
+      name: 'Volet salon',
+      room: { name: 'Salon', selector: 'salon' },
+      features: [
+        { id: 'f-volet-state', selector: 'volet-salon-state', name: 'État', category: 'shutter', type: 'state' },
+      ],
+    };
+    const lampeCuisine = {
+      selector: 'lampe-cuisine',
+      name: 'Lampe cuisine',
+      room: { name: 'Cuisine', selector: 'cuisine' },
+      features: [
+        { id: 'f-cuisine-binary', selector: 'lampe-cuisine-binary', name: 'On/Off', category: 'light', type: 'binary' },
+      ],
+    };
+
+    const ALL_BATCHABLE = [
+      'camera_get_image',
+      'scene_start',
+      'device_get_state',
+      'device_turn_on_off',
+      'device_get_history',
+      'device_set_shutter',
+      'device_set_light',
+      'web_fetch',
+      'time_compare_times',
+    ];
+
+    const buildMcpHandler = ({
+      devices = [lampeSalon, voletSalon, lampeCuisine],
+      setValue = stub().resolves(),
+      getImagesInRoom = stub().resolves(['data:image/jpeg;base64,/9j/4AAQ', 'data:image/jpeg;base64,ABCD']),
+    } = {}) => ({
+      serviceId: 'a2a2b3b4-31cc-4d2a-bbdd-128cd49755e6',
+      getAllTools,
+      isSensorFeature,
+      isSwitchableFeature,
+      isLightControlFeature,
+      isShutterFeature,
+      isHistoryFeature,
+      isBatteryFeature,
+      isWritableSensorFeature,
+      findBySimilarity,
+      formatValue: stub().returns({ value: 1 }),
+      toon: stub().callsFake((value) => JSON.stringify(value)),
+      gladys: {
+        room: {
+          getAll: stub().resolves([
+            { id: 'room-1', name: 'Salon', selector: 'salon', house_id: 'house-1' },
+            { id: 'room-2', name: 'Cuisine', selector: 'cuisine', house_id: 'house-1' },
+          ]),
+        },
+        user: { get: stub().resolves([]), getById: stub().resolves({}) },
+        house: { get: stub().resolves([{ id: 'house-1', name: 'Maison', selector: 'maison' }]) },
+        calendar: { get: stub().resolves([]) },
+        area: { get: stub().resolves([]) },
+        scene: { get: stub().resolves([{ id: 'scene-1', name: 'Nuit', selector: 'nuit' }]), create: stub() },
+        device: { get: stub().resolves(devices), setValue, camera: { getImagesInRoom } },
+        variable: { getValue: stub().resolves(null) },
+        event: { emit: fake() },
+      },
+      levenshtein: { distance: stub().returns(10) },
+    });
+
+    const getBatchTool = async (mcpHandler) => {
+      const tools = await mcpHandler.getAllTools();
+
+      return tools.find((tool) => tool.intent === 'batch.tool-calls');
+    };
+
+    it('should batch every tool of this home but scene.create', async () => {
+      const batchTool = await getBatchTool(buildMcpHandler());
+
+      // Batching helps whatever the request is about, so the router must never filter it out.
+      expect(batchTool.config.categories).to.deep.equal(AI_CHAT_TOOL_CATEGORIES_LIST);
+      expect(batchTool.config.description).to.contain(ALL_BATCHABLE.join(', '));
+      // scene.create is tracked by name by the chat gateway, batching it would break that.
+      expect(batchTool.config.description).to.not.contain('scene_create');
+      // status must not be sold as "the change was applied": a dispatched tool can
+      // still report in its own words that it did not act.
+      expect(batchTool.config.description).to.contain(
+        'Always read result, never status alone, before telling the user a change was applied',
+      );
+
+      const [{ function: batchFunction }] = mcpToolsToChatApiFormat([batchTool]);
+      expect(batchFunction.name).to.eq('batch_tool_calls');
+      expect(batchFunction.parameters.properties.calls.items.properties.tool.enum).to.deep.equal(ALL_BATCHABLE);
+      expect(batchFunction.parameters.properties.calls.maxItems).to.eq(50);
+    });
+
+    it('should not offer a tool this home does not have', async () => {
+      const batchTool = await getBatchTool(buildMcpHandler({ devices: [lampeCuisine] }));
+
+      expect(batchTool.config.description).to.contain('device_turn_on_off');
+      expect(batchTool.config.description).to.not.contain('device_set_shutter');
+      expect(batchTool.config.description).to.not.contain('device_set_light');
+    });
+
+    it('should run the calls one after the other, in the order given', async () => {
+      const mcpHandler = buildMcpHandler();
+      const batchTool = await getBatchTool(mcpHandler);
+
+      const result = await batchTool.cb({
+        calls: [
+          { tool: 'device_turn_on_off', arguments: { action: 'on', device: 'Lampe salon' } },
+          { tool: 'device_set_light', arguments: { brightness: 20, device: 'Lampe salon' } },
+          { tool: 'device_set_shutter', arguments: { action: 'close', device: 'Volet salon' } },
+          { tool: 'scene_start', arguments: { scene: 'Nuit' } },
+        ],
+      });
+
+      expect(
+        mcpHandler.gladys.device.setValue.args.map(([device, feature, value]) => [
+          device.selector,
+          feature.selector,
+          value,
+        ]),
+      ).to.deep.equal([
+        ['lampe-salon', 'lampe-salon-binary', 1],
+        ['lampe-salon', 'lampe-salon-brightness', 20],
+        ['volet-salon', 'volet-salon-state', COVER_STATE.CLOSE],
+      ]);
+      expect(mcpHandler.gladys.event.emit.callCount).to.eq(1);
+
+      expect(JSON.parse(result.content[0].text)).to.deep.equal({
+        dispatched: 4,
+        failed: 0,
+        results: [
+          {
+            call: 1,
+            tool: 'device_turn_on_off',
+            status: 'dispatched',
+            result: 'device.turn-on command sent for Lampe salon',
+          },
+          {
+            call: 2,
+            tool: 'device_set_light',
+            status: 'dispatched',
+            result: 'device.set-light: brightness 20% command sent for Lampe salon',
+          },
+          {
+            call: 3,
+            tool: 'device_set_shutter',
+            status: 'dispatched',
+            result: 'device.set-shutter: close command sent for Volet salon',
+          },
+          { call: 4, tool: 'scene_start', status: 'dispatched', result: 'scene.start command sent' },
+        ],
+      });
+    });
+
+    it('should batch read tools too, and carry the camera images up to the user', async () => {
+      const mcpHandler = buildMcpHandler();
+      const batchTool = await getBatchTool(mcpHandler);
+
+      const result = await batchTool.cb({
+        calls: [
+          { tool: 'camera_get_image', arguments: { room: 'Salon' } },
+          {
+            tool: 'time_compare_times',
+            arguments: { operator: 'before', reference_time: '08:00', compare_to: '09:00' },
+          },
+        ],
+      });
+
+      // The gateway picks the images out of the content of the tool result: dropping
+      // them here would silently lose them.
+      expect(result.content.slice(1)).to.deep.equal([
+        { type: 'image', data: '/9j/4AAQ', mimeType: 'image/jpeg' },
+        { type: 'image', data: 'ABCD', mimeType: 'image/jpeg' },
+      ]);
+
+      const summary = JSON.parse(result.content[0].text);
+      expect(summary.dispatched).to.eq(2);
+      expect(summary.failed).to.eq(0);
+      expect(summary.results[0]).to.deep.equal({
+        call: 1,
+        tool: 'camera_get_image',
+        status: 'dispatched',
+        result: '2 image(s) returned to the user.',
+      });
+      expect(summary.results[1].tool).to.eq('time_compare_times');
+      expect(summary.results[1].status).to.eq('dispatched');
+    });
+
+    it('should keep going after a failing call and report every outcome', async () => {
+      const mcpHandler = buildMcpHandler({
+        setValue: stub().callsFake((device) => {
+          if (device.selector === 'lampe-cuisine') {
+            return Promise.reject(new Error('MQTT broker unreachable'));
+          }
+          if (device.selector === 'volet-salon') {
+            // Not every integration rejects with an Error, which is exactly what
+            // this test covers.
+            // eslint-disable-next-line prefer-promise-reject-errors
+            return Promise.reject('Z-Wave node did not answer');
+          }
+          return Promise.resolve();
+        }),
+      });
+      const batchTool = await getBatchTool(mcpHandler);
+
+      const result = await batchTool.cb({
+        calls: [
+          { tool: 'device_turn_on_off', arguments: { action: 'off', device: 'Lampe cuisine' } },
+          { tool: 'device_turn_on_off', arguments: { action: 'off' } },
+          { tool: 'device_turn_on_off' },
+          { tool: 'device_set_shutter', arguments: { action: 'close', device: 'Volet salon' } },
+          { tool: 'device_turn_on_off', arguments: { action: 'off', device: 'Lampe salon' } },
+        ],
+      });
+
+      expect(JSON.parse(result.content[0].text)).to.deep.equal({
+        dispatched: 3,
+        failed: 2,
+        results: [
+          { call: 1, tool: 'device_turn_on_off', status: 'error', result: 'MQTT broker unreachable' },
+          {
+            call: 2,
+            tool: 'device_turn_on_off',
+            status: 'dispatched',
+            result:
+              'device.turn-off: missing target. Provide device name, or both room and device_category. ' +
+              'Never call with only action.',
+          },
+          {
+            call: 3,
+            tool: 'device_turn_on_off',
+            status: 'dispatched',
+            result:
+              'device.turn-undefined: missing target. Provide device name, or both room and device_category. ' +
+              'Never call with only action.',
+          },
+          { call: 4, tool: 'device_set_shutter', status: 'error', result: 'Z-Wave node did not answer' },
+          {
+            call: 5,
+            tool: 'device_turn_on_off',
+            status: 'dispatched',
+            result: 'device.turn-off command sent for Lampe salon',
+          },
+        ],
+      });
+      // The last call ran even though the first one threw.
+      expect(mcpHandler.gladys.device.setValue.args.map(([device]) => device.selector)).to.deep.equal([
+        'lampe-cuisine',
+        'volet-salon',
+        'lampe-salon',
+      ]);
+    });
+
+    it('should name the tools it can dispatch to when the tool is unknown', async () => {
+      const batchTool = await getBatchTool(buildMcpHandler());
+
+      const result = await batchTool.cb({
+        calls: [{ tool: 'scene_create', arguments: {} }, null],
+      });
+
+      const unknownToolMessage = `unknown tool, tools that can be batched: ${ALL_BATCHABLE.join(', ')}`;
+      expect(JSON.parse(result.content[0].text)).to.deep.equal({
+        dispatched: 0,
+        failed: 2,
+        results: [
+          { call: 1, tool: 'scene_create', status: 'error', result: unknownToolMessage },
+          { call: 2, status: 'error', result: unknownToolMessage },
+        ],
+      });
+    });
+
+    it('should refuse an empty or malformed batch instead of reporting a success', async () => {
+      const mcpHandler = buildMcpHandler();
+      const batchTool = await getBatchTool(mcpHandler);
+
+      const emptyResult = await batchTool.cb({ calls: [] });
+      const malformedResult = await batchTool.cb({ calls: 'device_turn_on_off' });
+
+      expect(emptyResult.content[0].text).to.eq(
+        'batch.tool-calls: calls must be a non-empty array of { tool, arguments }, nothing was run.',
+      );
+      expect(malformedResult.content[0].text).to.eq(emptyResult.content[0].text);
+      expect(mcpHandler.gladys.device.setValue.callCount).to.eq(0);
+    });
+
+    it('should refuse a batch over the call limit without running any of it', async () => {
+      const mcpHandler = buildMcpHandler();
+      const batchTool = await getBatchTool(mcpHandler);
+
+      const result = await batchTool.cb({
+        calls: new Array(51).fill({
+          tool: 'device_turn_on_off',
+          arguments: { action: 'off', device: 'Lampe salon' },
+        }),
+      });
+
+      expect(result.content[0].text).to.eq(
+        'batch.tool-calls: 51 calls were sent, the limit is 50. ' +
+          'Nothing was run, split the request into several calls.',
+      );
+      expect(mcpHandler.gladys.device.setValue.callCount).to.eq(0);
     });
   });
 });
